@@ -64,50 +64,7 @@ export async function extractLeadsInBatches(
 
   for (let i = 0; i < rawRecords.length; i += batchSize) {
     const batch = rawRecords.slice(i, i + batchSize);
-    try {
-      const mappedBatch = await extractLeadsBatch(batch);
-      for (const record of mappedBatch) {
-        // Rule 6: Skip invalid records (lack BOTH an email AND a mobile number)
-        const hasEmail = record.email && record.email.trim().length > 0;
-        const hasMobile =
-          record.mobile_without_country_code &&
-          record.mobile_without_country_code.trim().length > 0;
-
-        if (!hasEmail && !hasMobile) {
-          skippedRecords.push({
-            record,
-            reason: "Record lacks both email and mobile number",
-          });
-          continue;
-        }
-
-        // Rule 3: Date format - created_at must be convertible using JavaScript's new Date()
-        if (record.created_at) {
-          const date = new Date(record.created_at);
-          if (isNaN(date.getTime())) {
-            // fallback to current date if invalid
-            record.created_at = new Date().toISOString();
-          } else {
-            // Convert to a clean ISO/UTC string or keep it parseable
-            record.created_at = date.toISOString();
-          }
-        } else {
-          record.created_at = new Date().toISOString();
-        }
-
-        parsedRecords.push(record);
-      }
-    } catch (error) {
-      console.error(`Error processing batch starting at index ${i}:`, error);
-      for (const r of batch) {
-        skippedRecords.push({
-          record: r,
-          reason: `Batch extraction failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        });
-      }
-    }
+    await processBatchWithFallback(batch, i, parsedRecords, skippedRecords);
   }
 
   return {
@@ -116,6 +73,80 @@ export async function extractLeadsInBatches(
     totalImported: parsedRecords.length,
     totalSkipped: skippedRecords.length,
   };
+}
+
+/**
+ * Attempts a batch; if it fails (timeout, truncation, bad JSON), retries once
+ * by splitting the batch in half instead of failing the whole import.
+ * If a batch of size 1 still fails, those records are recorded as skipped
+ * with the reason, rather than hanging or crashing the request.
+ */
+async function processBatchWithFallback(
+  batch: any[],
+  startIndex: number,
+  parsedRecords: CRMLead[],
+  skippedRecords: any[]
+): Promise<void> {
+  try {
+    const mappedBatch = await extractLeadsBatch(batch);
+    applyMappedBatch(mappedBatch, batch, parsedRecords, skippedRecords);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Batch at index ${startIndex} failed (${message}).`);
+
+    if (batch.length === 1) {
+      skippedRecords.push({
+        record: batch[0],
+        reason: `Batch extraction failed: ${message}`,
+      });
+      return;
+    }
+
+    // Split and retry — a smaller batch is far less likely to hit output-token limits.
+    console.error(`Retrying as two smaller batches...`);
+    const mid = Math.ceil(batch.length / 2);
+    await processBatchWithFallback(batch.slice(0, mid), startIndex, parsedRecords, skippedRecords);
+    await processBatchWithFallback(batch.slice(mid), startIndex + mid, parsedRecords, skippedRecords);
+  }
+}
+
+function applyMappedBatch(
+  mappedBatch: CRMLead[],
+  originalBatch: any[],
+  parsedRecords: CRMLead[],
+  skippedRecords: any[]
+): void {
+  for (const record of mappedBatch) {
+    // Rule 6: Skip invalid records (lack BOTH an email AND a mobile number)
+    const hasEmail = record.email && record.email.trim().length > 0;
+    const hasMobile =
+      record.mobile_without_country_code &&
+      record.mobile_without_country_code.trim().length > 0;
+
+    if (!hasEmail && !hasMobile) {
+      skippedRecords.push({
+        record,
+        reason: "Record lacks both email and mobile number",
+      });
+      continue;
+    }
+
+    // Rule 3: Date format - created_at must be convertible using JavaScript's new Date()
+    if (record.created_at) {
+      const date = new Date(record.created_at);
+      if (isNaN(date.getTime())) {
+        // fallback to current date if invalid
+        record.created_at = new Date().toISOString();
+      } else {
+        // Convert to a clean ISO/UTC string or keep it parseable
+        record.created_at = date.toISOString();
+      }
+    } else {
+      record.created_at = new Date().toISOString();
+    }
+
+    parsedRecords.push(record);
+  }
 }
 
 /**
@@ -171,69 +202,96 @@ Return the output strictly as a JSON array of objects conforming to the response
     2
   )}`;
 
-  const response = await ai.models.generateContent({
-    model: "gemini-3.5-flash",
-    contents: prompt,
-    config: {
-      systemInstruction,
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            created_at: {
-              type: Type.STRING,
-              description:
-                "Lead creation date (ISO string or format parseable by new Date())",
+  // Fail fast instead of hanging forever if Gemini stalls on a request.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  let response;
+  try {
+    response = await ai.models.generateContent({
+      // gemini-3.1-flash-lite: current GA model, available to new API keys,
+      // and not affected by the gemini-3.5-flash structured-output stall.
+      model: "gemini-3.1-flash-lite",
+      contents: prompt,
+      config: {
+        abortSignal: controller.signal,
+        systemInstruction,
+        // Minimal thinking: this is field-mapping, not multi-step reasoning,
+        // and keeps the token budget free for the actual JSON output.
+        thinkingConfig: { thinkingLevel: "low" },
+        // Generous ceiling so a full batch of verbose records can't be cut off mid-string.
+        maxOutputTokens: 32768,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              created_at: {
+                type: Type.STRING,
+                description:
+                  "Lead creation date (ISO string or format parseable by new Date())",
+              },
+              name: { type: Type.STRING, description: "Lead name" },
+              email: { type: Type.STRING, description: "Primary email address" },
+              country_code: {
+                type: Type.STRING,
+                description: "Country code (e.g. +91)",
+              },
+              mobile_without_country_code: {
+                type: Type.STRING,
+                description: "Mobile number without country code",
+              },
+              company: { type: Type.STRING, description: "Company name" },
+              city: { type: Type.STRING, description: "City name" },
+              state: { type: Type.STRING, description: "State name" },
+              country: { type: Type.STRING, description: "Country name" },
+              lead_owner: {
+                type: Type.STRING,
+                description: "Lead owner email or name",
+              },
+              crm_status: {
+                type: Type.STRING,
+                description:
+                  "Lead status. Must be: GOOD_LEAD_FOLLOW_UP, DID_NOT_CONNECT, BAD_LEAD, SALE_DONE, or empty",
+              },
+              crm_note: {
+                type: Type.STRING,
+                description:
+                  "Notes/remarks. Include any extra emails, extra phone numbers, comments, or details here.",
+              },
+              data_source: {
+                type: Type.STRING,
+                description:
+                  "Source. Must be: leads_on_demand, meridian_tower, eden_park, varah_swamy, sarjapur_plots, or empty",
+              },
+              possession_time: {
+                type: Type.STRING,
+                description: "Property possession time description",
+              },
+              description: {
+                type: Type.STRING,
+                description: "Additional description of the lead",
+              },
             },
-            name: { type: Type.STRING, description: "Lead name" },
-            email: { type: Type.STRING, description: "Primary email address" },
-            country_code: {
-              type: Type.STRING,
-              description: "Country code (e.g. +91)",
-            },
-            mobile_without_country_code: {
-              type: Type.STRING,
-              description: "Mobile number without country code",
-            },
-            company: { type: Type.STRING, description: "Company name" },
-            city: { type: Type.STRING, description: "City name" },
-            state: { type: Type.STRING, description: "State name" },
-            country: { type: Type.STRING, description: "Country name" },
-            lead_owner: {
-              type: Type.STRING,
-              description: "Lead owner email or name",
-            },
-            crm_status: {
-              type: Type.STRING,
-              description:
-                "Lead status. Must be: GOOD_LEAD_FOLLOW_UP, DID_NOT_CONNECT, BAD_LEAD, SALE_DONE, or empty",
-            },
-            crm_note: {
-              type: Type.STRING,
-              description:
-                "Notes/remarks. Include any extra emails, extra phone numbers, comments, or details here.",
-            },
-            data_source: {
-              type: Type.STRING,
-              description:
-                "Source. Must be: leads_on_demand, meridian_tower, eden_park, varah_swamy, sarjapur_plots, or empty",
-            },
-            possession_time: {
-              type: Type.STRING,
-              description: "Property possession time description",
-            },
-            description: {
-              type: Type.STRING,
-              description: "Additional description of the lead",
-            },
+            required: [],
           },
-          required: [],
         },
       },
-    },
-  });
+    });
+  } catch (error: any) {
+    if (error?.name === "AbortError") {
+      throw new Error("Gemini API request timed out after 60s (no response received).");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const finishReason = response.candidates?.[0]?.finishReason;
+  if (finishReason === "MAX_TOKENS") {
+    throw new Error("Gemini response was truncated (MAX_TOKENS).");
+  }
 
   const text = response.text;
   if (!text) {
