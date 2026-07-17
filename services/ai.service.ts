@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -218,7 +218,7 @@ Return the output strictly as a JSON array of objects conforming to the response
         systemInstruction,
         // Minimal thinking: this is field-mapping, not multi-step reasoning,
         // and keeps the token budget free for the actual JSON output.
-        thinkingConfig: { thinkingLevel: "low" },
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         // Generous ceiling so a full batch of verbose records can't be cut off mid-string.
         maxOutputTokens: 32768,
         responseMimeType: "application/json",

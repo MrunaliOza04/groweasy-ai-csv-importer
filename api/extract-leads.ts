@@ -1,12 +1,13 @@
-import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { extractLeadsInBatches } from "../services/ai.service";
 
 // Vercel treats any file under /api as a serverless function, automatically
 // mapped to /api/<filename> — no vercel.json required for this route.
 // This mirrors the POST /api/extract-leads handler in server.ts exactly,
 // so production behaves identically to local `npm run dev`.
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // CORS (safe to keep even though frontend + API share the same domain on Vercel)
+export default async function handler(
+  req: any,
+  res: any
+) {// CORS (safe to keep even though frontend + API share the same domain on Vercel)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
